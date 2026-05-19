@@ -44,12 +44,17 @@ def kl_old_new(old_policy, new_policy, obs):
 
 
 def fisher_vector_product(policy, obs, v, damping=1e-2):
-    dist = policy.dist(obs)
+    with torch.no_grad():
+        old_dist = policy.dist(obs)
+        old_mu = old_dist.loc.detach()
+        old_std = old_dist.scale.detach()
 
-    act = dist.sample()
-    logp = dist.log_prob(act).sum(-1).mean()
+    new_dist = policy.dist(obs)
+    
+    # Use analytical KL divergence to guarantee a positive semi-definite Hessian
+    kl = torch.distributions.kl_divergence(Normal(old_mu, old_std), new_dist).mean()
 
-    grads = torch.autograd.grad(logp, policy.parameters(), create_graph=True)
+    grads = torch.autograd.grad(kl, policy.parameters(), create_graph=True)
     flat_grad = torch.cat([g.contiguous().view(-1) for g in grads])
 
     grad_v = (flat_grad * v).sum()
@@ -420,12 +425,26 @@ def run():
         # -------------------------
         dyn_loss = algo.train_dynamics((obs_t, act_t, nxt_t))
 
+        # 1. Compute Value baselines properly
         with torch.no_grad():
-            values = algo.value(obs_t).detach()
+            values = algo.value(obs_t).cpu().numpy()
+            # Get value of the very last next_obs to bootstrap the trajectory end
+            last_obs = torch.tensor(real_data[-1][3], dtype=torch.float32, device=device)
+            last_val = algo.value(last_obs).item()
+            val_seq = np.append(values, last_val)
 
-        # bootstrap returns (simple but valid baseline)
-        ret = values + torch.randn_like(values) * 0.01  # small noise ONLY for stability
-        adv = ret - values
+        rewards = [d[2] for d in real_data]
+        dones = [d[4] for d in real_data]
+
+        # 2. Use the compute_gae function correctly
+        returns, advs = compute_gae(rewards, val_seq, dones)
+
+        ret = torch.tensor(returns, dtype=torch.float32, device=device)
+        adv = torch.tensor(advs, dtype=torch.float32, device=device)
+
+        # 3. Compute REAL old_logp before updating the policy
+        with torch.no_grad():
+            old_logp = algo.policy.log_prob(obs_t, act_t)
 
         # -------------------------
         # POLICY + VALUE LOSS
@@ -433,8 +452,8 @@ def run():
         pol_loss, entropy = algo.policy_loss(obs_t, act_t, adv)
         val_loss = algo.value_loss(obs_t, ret)
 
-        # TRPO step (returns KL approx via surrogate shift)
-        kl = algo.trpo_step(obs_t, act_t, adv, torch.zeros_like(adv))
+        # 4. Pass the real old_logp into the TRPO step
+        kl = algo.trpo_step(obs_t, act_t, adv, old_logp)
         algo.train_value(obs_t, ret)
 
         # -------------------------
