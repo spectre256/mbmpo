@@ -36,22 +36,17 @@ def explained_variance(y_pred, y):
 def kl_old_new(old_policy, new_policy, obs):
     with torch.no_grad():
         old_dist = old_policy.dist(obs)
-
     new_dist = new_policy.dist(obs)
-
     kl = torch.distributions.kl_divergence(old_dist, new_dist).sum(-1)
     return kl.mean()
 
 
 def fisher_vector_product(policy, obs, v, damping=1e-2):
-    with torch.no_grad():
-        old_dist = policy.dist(obs)
-        old_mu = old_dist.loc.detach()
-        old_std = old_dist.scale.detach()
+    old_dist = policy.dist(obs)
+    old_mu = old_dist.loc.detach()
+    old_std = old_dist.scale.detach()
 
     new_dist = policy.dist(obs)
-    
-    # Use analytical KL divergence to guarantee a positive semi-definite Hessian
     kl = torch.distributions.kl_divergence(Normal(old_mu, old_std), new_dist).mean()
 
     grads = torch.autograd.grad(kl, policy.parameters(), create_graph=True)
@@ -67,7 +62,6 @@ def fisher_vector_product(policy, obs, v, damping=1e-2):
 class MetricLogger:
     def __init__(self, window=50):
         self.window = window
-
         self.metrics = {
             "dyn_loss": deque(maxlen=window),
             "policy_loss": deque(maxlen=window),
@@ -76,7 +70,6 @@ class MetricLogger:
             "reward": deque(maxlen=window),
             "entropy": deque(maxlen=window),
         }
-
         self.latest = {k: 0.0 for k in self.metrics.keys()}
 
     def log(self, **kwargs):
@@ -98,7 +91,7 @@ class MetricLogger:
         )
 
 # ----------------------------
-# Gaussian Policy
+# Gaussian Policy (With Functional Graph Support)
 # ----------------------------
 
 class Policy(nn.Module):
@@ -112,14 +105,29 @@ class Policy(nn.Module):
         std = torch.exp(self.log_std)
         return Normal(mu, std)
 
-    def act(self, obs):
-        obs = to_tensor(obs)
-        dist = self.dist(obs)
-        a = dist.sample()
-        return a.cpu().numpy()
+    def functional_dist(self, obs, params=None):
+        if params is None:
+            return self.dist(obs)
+            
+        x = obs
+        x = torch.nn.functional.linear(x, params['net.0.weight'], params['net.0.bias'])
+        x = torch.nn.functional.relu(x)
+        x = torch.nn.functional.linear(x, params['net.2.weight'], params['net.2.bias'])
+        x = torch.nn.functional.relu(x)
+        mu = torch.nn.functional.linear(x, params['net.4.weight'], params['net.4.bias'])
+        
+        std = torch.exp(params['log_std'])
+        return Normal(mu, std)
 
-    def log_prob(self, obs, act):
-        dist = self.dist(obs)
+    def act(self, obs, params=None):
+        obs = to_tensor(obs)
+        with torch.set_grad_enabled(params is not None):
+            dist = self.functional_dist(obs, params)
+            a = dist.sample()
+        return a.detach().cpu().numpy() if params is None else a
+
+    def log_prob(self, obs, act, params=None):
+        dist = self.functional_dist(obs, params)
         return dist.log_prob(act).sum(-1)
 
 # ----------------------------
@@ -135,7 +143,7 @@ class Value(nn.Module):
         return self.net(x).squeeze(-1)
 
 # ----------------------------
-# Dynamics Ensemble
+# Dynamics Ensemble (Shift 3: State Delta Prediction Architecture)
 # ----------------------------
 
 class Dynamics(nn.Module):
@@ -148,52 +156,25 @@ class Dynamics(nn.Module):
 
     def forward(self, obs, act, i):
         x = torch.cat([obs, act], dim=-1)
-        return self.models[i](x)
-
-# ----------------------------
-# Rollout Buffer
-# ----------------------------
-
-class Buffer:
-    def __init__(self):
-        self.obs, self.act, self.adv, self.ret, self.logp = [], [], [], [], []
-
-    def add(self, o, a, adv, r, lp):
-        self.obs.append(o)
-        self.act.append(a)
-        self.adv.append(adv)
-        self.ret.append(r)
-        self.logp.append(lp)
-
-    def get(self):
-        return (
-            torch.cat(self.obs),
-            torch.cat(self.act),
-            torch.cat(self.adv),
-            torch.cat(self.ret),
-            torch.cat(self.logp),
-        )
-
-    def clear(self):
-        self.__init__()
+        # Shift 3 Principle: Outputs current state + delta predicted change
+        return obs + self.models[i](x)
 
 # ----------------------------
 # GAE
 # ----------------------------
 
 def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
-    adv = 0
+    advs = []
     returns = []
+    adv = 0
     for t in reversed(range(len(rewards))):
         mask = 1.0 - dones[t]
         delta = rewards[t] + gamma * values[t+1] * mask - values[t]
         adv = delta + gamma * lam * mask * adv
+        advs.append(adv)
         returns.append(adv + values[t])
-    return list(reversed(returns)), list(reversed([a for a in returns]))
+    return list(reversed(returns)), list(reversed(advs))
 
-# ----------------------------
-# TRPO helpers
-# ----------------------------
 
 def flat_params(model):
     return torch.cat([p.data.view(-1) for p in model.parameters()])
@@ -205,11 +186,197 @@ def set_params(model, flat):
         p.data.copy_(flat[idx:idx+n].view_as(p))
         idx += n
 
-def kl_divergence(policy, obs, old_dist):
-    dist = policy.dist(obs)
-    return torch.distributions.kl_divergence(old_dist, dist).mean()
+# ----------------------------
+# MB-MPO Core
+# ----------------------------
 
-# conjugate gradient
+class MBMPO:
+    def __init__(self, obs_dim, act_dim):
+        self.policy = Policy(obs_dim, act_dim).to(device)
+        self.value = Value(obs_dim).to(device)
+        self.dyn = Dynamics(obs_dim, act_dim).to(device)
+
+        self.v_opt = optim.Adam(self.value.parameters(), lr=3e-4)
+        self.dyn_opt = optim.Adam(self.dyn.parameters(), lr=1e-3)
+
+        self.ensemble_size = len(self.dyn.models)
+        self.inner_lr = 1e-3 
+
+    def train_dynamics(self, real_data):
+        obs_t = torch.tensor(np.array([d[0] for d in real_data]), dtype=torch.float32, device=device)
+        act_t = torch.tensor(np.array([d[1] for d in real_data]), dtype=torch.float32, device=device)
+        next_obs = torch.tensor(np.array([d[3] for d in real_data]), dtype=torch.float32, device=device)
+
+        # Shift 3 Principle: Calculate loss targets based on state differences (deltas)
+        delta_targets = next_obs - obs_t
+
+        total_loss = 0.0
+        for i in range(self.ensemble_size):
+            x = torch.cat([obs_t, act_t], dim=-1)
+            
+            # --- FIX HERE: Index into the ModuleList properly ---
+            pred_delta = self.dyn.models[i](x)  
+            
+            loss = ((pred_delta - delta_targets) ** 2).mean()
+
+            self.dyn_opt.zero_grad()
+            loss.backward()
+            self.dyn_opt.step()
+
+            total_loss += loss.item()
+
+        return total_loss / self.ensemble_size
+
+    # ------------------------
+    # Task-Specific Simulator Rollout Loop (With Shift 3 Reality Grounding)
+    # ------------------------
+    def rollout_single_model(self, model_idx, init_obs, params=None, horizon=20, batch_size=1000):
+        o = init_obs.repeat(batch_size, 1)
+        
+        # Track simulated done status per parallel thread batch
+        batch_dones = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        
+        obs_seq, act_seq, rew_seq, done_seq = [], [], [], []
+
+        for _ in range(horizon):
+            if params is not None:
+                dist = self.policy.functional_dist(o, params)
+                a = dist.sample()
+            else:
+                with torch.no_grad():
+                    dist = self.policy.dist(o)
+                    a = dist.sample()
+
+            next_o = self.dyn(o, a, model_idx)
+            
+            # ---------------------------------------------
+            # Shift 3: Analytical Ant-v5 Reward Logic Implementation
+            # ---------------------------------------------
+            forward_velocity = next_o[:, 13]  # Index 13 tracks forward velocity in Ant-v5
+            control_cost = 0.5 * torch.sum(a ** 2, dim=-1)
+            
+            # Torso height is checked at index 0 to see if it remains standing
+            torso_height = next_o[:, 0]
+            is_healthy = (torso_height > 0.2) & (torso_height < 1.0)
+            healthy_reward = torch.where(is_healthy, torch.ones_like(torso_height), torch.zeros_like(torso_height))
+            
+            r = forward_velocity - control_cost + healthy_reward
+            
+            # ---------------------------------------------
+            # Shift 3: Done Boundary Termination Masking
+            # ---------------------------------------------
+            # If healthy bounds are crossed, flag done status for those indices
+            step_dones = torch.where(is_healthy, torch.zeros_like(torso_height), torch.ones_like(torso_height))
+            batch_dones = torch.max(batch_dones, step_dones)  # Lock in a done state once hit
+
+            obs_seq.append(o)
+            act_seq.append(a)
+            rew_seq.append(r)
+            done_seq.append(batch_dones.clone())
+            
+            o = next_o
+
+        return (
+            torch.stack(obs_seq, dim=0), 
+            torch.stack(act_seq, dim=0), 
+            torch.stack(rew_seq, dim=0), 
+            torch.stack(done_seq, dim=0)
+        )
+
+    def adapt_policy(self, model_idx, init_obs, horizon=20, batch_size=1000):
+        obs, act, rew, done = self.rollout_single_model(model_idx, init_obs, params=None, horizon=horizon, batch_size=batch_size)
+        
+        obs_flat = obs.view(-1, obs.shape[-1])
+        act_flat = act.view(-1, act.shape[-1])
+
+        with torch.no_grad():
+            vals = self.value(obs_flat).view(obs.shape[0], obs.shape[1]).cpu().numpy()
+            val_seq = np.vstack([vals, np.zeros((1, batch_size))])
+        
+        rew_np = rew.detach().cpu().numpy()
+        done_np = done.detach().cpu().numpy()
+
+        all_advs = []
+        for b in range(batch_size):
+            _, advs = compute_gae(rew_np[:, b], val_seq[:, b], done_np[:, b])
+            all_advs.append(advs)
+        
+        adv_tensor = torch.tensor(np.array(all_advs).T, dtype=torch.float32, device=device).reshape(-1)
+        adv_norm = (adv_tensor - adv_tensor.mean()) / (adv_tensor.std() + 1e-8)
+
+        logp = self.policy.log_prob(obs_flat, act_flat, params=None)
+        inner_loss = -(logp * adv_norm).mean()
+
+        grads = torch.autograd.grad(inner_loss, self.policy.parameters(), create_graph=True)
+
+        adapted_params = {}
+        for (name, p), g in zip(self.policy.named_parameters(), grads):
+            adapted_params[name] = p - self.inner_lr * g
+
+        return adapted_params
+
+    def meta_trpo_step(self, meta_obs, meta_act, meta_adv, meta_old_logp, adapted_params_list):
+        meta_obs = meta_obs.detach()
+        meta_act = meta_act.detach()
+        meta_adv = meta_adv.detach()
+        meta_adv = (meta_adv - meta_adv.mean()) / (meta_adv.std() + 1e-8)
+
+        theta_old = flat_params(self.policy).detach()
+
+        def meta_surrogate(flat_params_vec):
+            set_params(self.policy, flat_params_vec)
+            
+            total_surr = 0.0
+            idx_start = 0
+            samples_per_model = meta_obs.shape[0] // self.ensemble_size
+
+            for i in range(self.ensemble_size):
+                idx_end = idx_start + samples_per_model
+                
+                m_obs = meta_obs[idx_start:idx_end]
+                m_act = meta_act[idx_start:idx_end]
+                m_adv = meta_adv[idx_start:idx_end]
+                m_old_logp = meta_old_logp[idx_start:idx_end]
+
+                logp = self.policy.log_prob(m_obs, m_act, params=adapted_params_list[i])
+                ratio = torch.exp(logp - m_old_logp)
+                total_surr += -(ratio * m_adv).mean()
+                
+                idx_start = idx_end
+
+            return total_surr / self.ensemble_size
+
+        loss = meta_surrogate(theta_old)
+
+        grads = torch.autograd.grad(loss, self.policy.parameters(), retain_graph=False)
+        g = torch.cat([x.view(-1) for x in grads]).detach()
+
+        def Hv(v):
+            return fisher_vector_product(self.policy, meta_obs, v)
+
+        step_dir = cg(Hv, g)
+        shs = step_dir @ Hv(step_dir)
+        step_size = torch.sqrt(2 * 0.01 / (shs + 1e-8))
+        full_step = step_size * step_dir
+
+        new_theta = theta_old - full_step
+        set_params(self.policy, new_theta)
+
+        kl = kl_old_new(copy.deepcopy(self.policy), self.policy, meta_obs)
+        return kl.item(), loss.item()
+
+    def train_value(self, obs, ret):
+        v = self.value(obs)
+        loss = ((v - ret) ** 2).mean()
+        self.v_opt.zero_grad()
+        loss.backward()
+        self.v_opt.step()
+
+    def value_loss(self, obs, ret):
+        v = self.value(obs)
+        return ((v - ret) ** 2).mean()
+
+
 def cg(Ax, b, iters=10):
     x = torch.zeros_like(b)
     r = b.clone()
@@ -227,162 +394,7 @@ def cg(Ax, b, iters=10):
     return x
 
 # ----------------------------
-# MB-MPO Core
-# ----------------------------
-
-class MBMPO:
-    def __init__(self, obs_dim, act_dim):
-        self.policy = Policy(obs_dim, act_dim).to(device)
-        self.value = Value(obs_dim).to(device)
-        self.dyn = Dynamics(obs_dim, act_dim).to(device)
-
-        self.v_opt = optim.Adam(self.value.parameters(), lr=3e-4)
-        self.dyn_opt = optim.Adam(self.dyn.parameters(), lr=1e-3)
-
-        self.ensemble_size = len(self.dyn.models)
-
-    # ------------------------
-    # Train dynamics
-    # ------------------------
-    def train_dynamics(self, data):
-        obs, act, next_obs = data
-        total_loss = 0.0
-
-        for i, model in enumerate(self.dyn.models):
-            pred = model(torch.cat([obs, act], dim=-1))
-            loss = ((pred - next_obs) ** 2).mean()
-
-            self.dyn_opt.zero_grad()
-            loss.backward()
-            self.dyn_opt.step()
-
-            total_loss += loss.item()
-
-        return total_loss / len(self.dyn.models)
-
-
-    def policy_loss(self, obs, act, adv):
-        dist = self.policy.dist(obs)
-        logp = dist.log_prob(act).sum(-1)
-        entropy = dist.entropy().sum(-1)
-
-        loss = -(logp * adv).mean()
-        return loss, entropy.mean().item()
-
-
-    def value_loss(self, obs, ret):
-        v = self.value(obs)
-        return ((v - ret) ** 2).mean()
-
-
-    # ------------------------
-    # Imagined rollout
-    # ------------------------
-    def rollout_model(self, env, horizon=5, batch_size=1024):
-        obs = env.reset()[0]
-        obs = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-        data = []
-
-        for i in range(self.ensemble_size):
-            o = obs.repeat(batch_size, 1)
-            traj = []
-
-            for _ in range(horizon):
-                dist = self.policy.dist(o)
-                a = dist.sample()
-                next_o = self.dyn(o, a, i)
-                r = -torch.sum(next_o**2, dim=-1)  # placeholder reward proxy
-                done = torch.zeros_like(r)
-
-                traj.append((o, a, r, next_o, done))
-                o = next_o.detach()
-
-            data.append(traj)
-
-        return data
-
-    # ------------------------
-    # MAML inner update
-    # ------------------------
-    def adapt_policy(self, traj):
-        obs, act, adv, _, _ = traj
-
-        dist = self.policy.dist(obs)
-        loss = -(dist.log_prob(act) * adv).mean()
-
-        grads = torch.autograd.grad(loss, self.policy.parameters(), create_graph=True)
-        adapted = []
-        for p, g in zip(self.policy.parameters(), grads):
-            adapted.append(p - 0.1 * g)
-        return adapted
-
-    # ------------------------
-    # TRPO update
-    # ------------------------
-    def trpo_step(self, obs, act, adv, old_logp):
-        obs = obs.detach()
-        act = act.detach()
-        adv = adv.detach()
-
-        # normalize advantages (CRITICAL)
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-
-        # snapshot policy BEFORE update
-        old_policy = copy.deepcopy(self.policy).to(device)
-        old_policy.eval()
-        for p in old_policy.parameters():
-            p.requires_grad_(False)
-
-        theta_old = flat_params(self.policy).detach()
-
-        # surrogate loss (NO PARAM MUTATION HERE)
-        def surrogate(flat_params_vec):
-            set_params(self.policy, flat_params_vec)
-
-            dist = self.policy.dist(obs)
-            logp = dist.log_prob(act).sum(-1)
-
-            ratio = torch.exp(logp - old_logp)
-            return -(ratio * adv).mean()
-
-        loss = surrogate(theta_old)
-
-        grads = torch.autograd.grad(loss, self.policy.parameters(), retain_graph=False)
-        g = torch.cat([x.view(-1) for x in grads]).detach()
-
-        def Hv(v):
-            return fisher_vector_product(self.policy, obs, v)
-
-        step_dir = cg(Hv, g)
-
-        shs = step_dir @ Hv(step_dir)
-        step_size = torch.sqrt(2 * 0.01 / (shs + 1e-8))
-
-        full_step = step_size * step_dir
-
-        new_theta = theta_old - full_step
-
-        # IMPORTANT: restore correct parameters AFTER surrogate eval
-        set_params(self.policy, new_theta)
-
-        # compute REAL KL AFTER update
-        kl = kl_old_new(old_policy, self.policy, obs)
-
-        return kl.item()
-
-
-    # ------------------------
-    # Value update
-    # ------------------------
-    def train_value(self, obs, ret):
-        v = self.value(obs)
-        loss = ((v - ret) ** 2).mean()
-        self.v_opt.zero_grad()
-        loss.backward()
-        self.v_opt.step()
-
-# ----------------------------
-# Training Loop
+# Main Execution Loop
 # ----------------------------
 
 def run():
@@ -392,18 +404,14 @@ def run():
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
     algo = MBMPO(obs_dim, act_dim)
-    n_iters = 500
+    n_iters = 100
 
+    for it in tqdm(range(n_iters), desc="MB-MPO Meta-Training"):
 
-    for it in tqdm(range(n_iters), desc="MB-MPO training"):
-
-        # -------------------------
-        # REAL ENV DATA COLLECTION
-        # -------------------------
+        # 1. Real data environment interaction tracking
+        real_data = []
         obs, _ = env.reset()
         ep_reward = 0.0
-
-        real_data = []
 
         while True:
             act = algo.policy.act(obs)
@@ -416,66 +424,90 @@ def run():
             if done or truncated:
                 break
 
-        obs_t = torch.tensor([d[0] for d in real_data], dtype=torch.float32, device=device)
-        act_t = torch.tensor([d[1] for d in real_data], dtype=torch.float32, device=device)
-        nxt_t = torch.tensor([d[3] for d in real_data], dtype=torch.float32, device=device)
+        dyn_loss = algo.train_dynamics(real_data)
+
+        # Anchor initial state using the real environment's latest observation point
+        init_obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device)
 
         # -------------------------
-        # DYNAMICS UPDATE
+        # PHASE A: INNER LOOP (TASK ADAPTATION)
         # -------------------------
-        dyn_loss = algo.train_dynamics((obs_t, act_t, nxt_t))
+        adapted_params_list = []
+        for i in range(algo.ensemble_size):
+            theta_prime = algo.adapt_policy(model_idx=i, init_obs=init_obs_tensor, horizon=20, batch_size=200)
+            adapted_params_list.append(theta_prime)
 
-        # 1. Compute Value baselines properly
+        # -------------------------
+        # PHASE B: OUTER LOOP (META-OPTIMIZATION TRAJECTORIES)
+        # -------------------------
+        meta_obs_list, meta_act_list, meta_rew_list, meta_done_list = [], [], [], []
+
+        for i in range(algo.ensemble_size):
+            m_obs, m_act, m_rew, m_done = algo.rollout_single_model(
+                model_idx=i, init_obs=init_obs_tensor, params=adapted_params_list[i], horizon=20, batch_size=200
+            )
+            meta_obs_list.append(m_obs.view(-1, obs_dim))
+            meta_act_list.append(m_act.view(-1, act_dim))
+            meta_rew_list.append(m_rew.reshape(-1))
+            meta_done_list.append(m_done.reshape(-1))
+
+        post_obs = torch.cat(meta_obs_list, dim=0)
+        post_act = torch.cat(meta_act_list, dim=0)
+        post_rew = torch.cat(meta_rew_list, dim=0)
+        post_done = torch.cat(meta_done_list, dim=0)
+
         with torch.no_grad():
-            values = algo.value(obs_t).cpu().numpy()
-            # Get value of the very last next_obs to bootstrap the trajectory end
-            last_obs = torch.tensor(real_data[-1][3], dtype=torch.float32, device=device)
-            last_val = algo.value(last_obs).item()
-            val_seq = np.append(values, last_val)
+            post_values = algo.value(post_obs).cpu().numpy()
+            val_seq = np.append(post_values, 0.0)
 
-        rewards = [d[2] for d in real_data]
-        dones = [d[4] for d in real_data]
+        post_rew_np = post_rew.detach().cpu().numpy()
+        post_done_np = post_done.detach().cpu().numpy()
 
-        # 2. Use the compute_gae function correctly
-        returns, advs = compute_gae(rewards, val_seq, dones)
+        returns, advs = compute_gae(post_rew_np, val_seq, post_done_np)
+        ret_tensor = torch.tensor(returns, dtype=torch.float32, device=device)
+        adv_tensor = torch.tensor(advs, dtype=torch.float32, device=device)
 
-        ret = torch.tensor(returns, dtype=torch.float32, device=device)
-        adv = torch.tensor(advs, dtype=torch.float32, device=device)
-
-        # 3. Compute REAL old_logp before updating the policy
         with torch.no_grad():
-            old_logp = algo.policy.log_prob(obs_t, act_t)
+            meta_old_logp_list = []
+            idx_start = 0
+            samples_per_model = post_obs.shape[0] // algo.ensemble_size
+            for i in range(algo.ensemble_size):
+                idx_end = idx_start + samples_per_model
+                m_o = post_obs[idx_start:idx_end]
+                m_a = post_act[idx_start:idx_end]
+                meta_old_logp_list.append(algo.policy.log_prob(m_o, m_a, params=adapted_params_list[i]))
+                idx_start = idx_end
+            meta_old_logp = torch.cat(meta_old_logp_list, dim=0)
 
-        # -------------------------
-        # POLICY + VALUE LOSS
-        # -------------------------
-        pol_loss, entropy = algo.policy_loss(obs_t, act_t, adv)
-        val_loss = algo.value_loss(obs_t, ret)
+        kl, pol_loss_val = algo.meta_trpo_step(post_obs, post_act, adv_tensor, meta_old_logp, adapted_params_list)
+        algo.train_value(post_obs, ret_tensor)
+        val_loss = algo.value_loss(post_obs, ret_tensor)
 
-        # 4. Pass the real old_logp into the TRPO step
-        kl = algo.trpo_step(obs_t, act_t, adv, old_logp)
-        algo.train_value(obs_t, ret)
+        # Extract the average reward calculated across the grounded simulation loop
+        sim_rew_avg = post_rew.mean().item()
 
         # -------------------------
         # LOGGING
         # -------------------------
         logger.log(
             dyn_loss=dyn_loss,
-            policy_loss=pol_loss.item(),
+            policy_loss=pol_loss_val,
             value_loss=val_loss.item(),
             kl=kl,
-            reward=ep_reward,
-            entropy=entropy
+            reward=sim_rew_avg,  # Now displays stabilized grounded simulator rewards
+            entropy=0.0
         )
 
-        # -------------------------
-        # LIVE STATUS LINE
-        # -------------------------
         tqdm.write(
             f"iter:{it:04d} | "
             f"{logger.line()} | "
             f"ep_rew:{ep_reward:.1f}"
         )
+        
+        if it == n_iters - 1:
+            # Save just the meta-policy weights
+            torch.save(algo.policy.state_dict(), "mb_mpo_policy.pt")
+            tqdm.write(f"--- Saved policy checkpoint to mb_mpo_policy.pt ---")
 
 
 if __name__ == "__main__":
