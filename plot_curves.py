@@ -43,11 +43,8 @@ def plot_rl_curves_from_folder(folder_path="."):
     
     # Extract rewards into 2D arrays (shape: num_runs x num_iters)
     ep_rewards = np.array([df['ep_reward'].values for df in dfs])
-    sim_rewards = np.array([df['sim_reward'].values for df in dfs])
-
     # Calculate Means
     ep_mean = np.mean(ep_rewards, axis=0)
-    sim_mean = np.mean(sim_rewards, axis=0)
 
     # Calculate 90% Confidence Interval
     confidence = 0.90
@@ -56,13 +53,10 @@ def plot_rl_curves_from_folder(folder_path="."):
     n_runs = len(dfs)
     if n_runs > 1:
         ep_std_err = np.std(ep_rewards, axis=0) / np.sqrt(n_runs)
-        sim_std_err = np.std(sim_rewards, axis=0) / np.sqrt(n_runs)
     else:
         ep_std_err = np.zeros_like(ep_mean)
-        sim_std_err = np.zeros_like(sim_mean)
 
     ep_ci = z_value * ep_std_err
-    sim_ci = z_value * sim_std_err
 
     # --- Plotting ---
     plt.figure(figsize=(10, 6))
@@ -70,10 +64,6 @@ def plot_rl_curves_from_folder(folder_path="."):
     # Plot Real Environment Episodic Reward
     plt.plot(iterations, ep_mean, label=f"Real Episode Reward (n={n_runs})", color='blue', linewidth=2)
     plt.fill_between(iterations, ep_mean - ep_ci, ep_mean + ep_ci, color='blue', alpha=0.15)
-
-    # Plot Grounded Simulation Reward
-    plt.plot(iterations, sim_mean, label=f"Simulated Reward (n={n_runs})", color='orange', linewidth=2)
-    plt.fill_between(iterations, sim_mean - sim_ci, sim_mean + sim_ci, color='orange', alpha=0.15)
 
     # Formatting
     plt.title("MB-MPO Training Performance (Mean ± 90% CI)", fontsize=14)
