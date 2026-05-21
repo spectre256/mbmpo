@@ -71,6 +71,7 @@ class MetricLogger:
             "kl": deque(maxlen=window),
             "reward": deque(maxlen=window),
             "entropy": deque(maxlen=window),
+            "uncertainty": deque(maxlen=window),
         }
         self.latest = {k: 0.0 for k in self.metrics.keys()}
 
@@ -90,6 +91,7 @@ class MetricLogger:
             f"val:{self.avg('value_loss'):.4f} | "
             f"kl:{self.avg('kl'):.5f} | "
             f"rew:{self.avg('reward'):.2f}"
+            f"unc:{self.avg('uncertainty'):.4f} | "
         )
 
 # ----------------------------
@@ -160,6 +162,21 @@ class Dynamics(nn.Module):
         x = torch.cat([obs, act], dim=-1)
         # Shift 3 Principle: Outputs current state + delta predicted change
         return obs + self.models[i](x)
+    
+    def ensemble_predict(self, obs, act):
+        preds = []
+
+        for model in self.models:
+            x = torch.cat([obs, act], dim=-1)
+            pred_next = obs + model(x)
+            preds.append(pred_next)
+
+        preds = torch.stack(preds, dim=0)
+
+        mean_pred = preds.mean(dim=0)
+        uncertainty = preds.std(dim=0).mean(dim=-1)
+
+        return mean_pred, uncertainty, preds
 
 # ----------------------------
 # GAE
@@ -264,7 +281,7 @@ class MBMPO:
         # Track simulated done status per parallel thread batch
         batch_dones = torch.zeros(batch_size, dtype=torch.float32, device=device)
         
-        obs_seq, act_seq, rew_seq, done_seq = [], [], [], []
+        obs_seq, act_seq, rew_seq, done_seq, uncertainty_seq = [], [], [], [], []
 
         for _ in range(horizon):
             if params is not None:
@@ -275,7 +292,10 @@ class MBMPO:
                     dist = self.policy.dist(o)
                     a = dist.sample()
 
-            next_o = self.dyn(o, a, model_idx)
+            mean_next_o, uncertainty, all_preds = self.dyn.ensemble_predict(o, a)
+
+            # keep single-model rollout identity if desired
+            next_o = all_preds[model_idx]
             
             # ---------------------------------------------
             # Shift 3: Analytical Ant-v5 Reward Logic Implementation
@@ -288,7 +308,14 @@ class MBMPO:
             is_healthy = (torso_height > 0.2) & (torso_height < 1.0)
             healthy_reward = torch.where(is_healthy, torch.ones_like(torso_height), torch.zeros_like(torso_height))
             
-            r = forward_velocity - control_cost + healthy_reward
+            beta = 0.1
+
+            r = (
+                forward_velocity
+                - control_cost
+                + healthy_reward
+                - beta * uncertainty
+            )
 
             r = r * (1.0 - batch_dones)
             
@@ -303,6 +330,7 @@ class MBMPO:
             act_seq.append(a)
             rew_seq.append(r)
             done_seq.append(batch_dones.clone())
+            uncertainty_seq.append(uncertainty.mean())
             
             o = next_o
 
@@ -310,11 +338,12 @@ class MBMPO:
             torch.stack(obs_seq, dim=0), 
             torch.stack(act_seq, dim=0), 
             torch.stack(rew_seq, dim=0), 
-            torch.stack(done_seq, dim=0)
+            torch.stack(done_seq, dim=0),
+            torch.stack(uncertainty_seq)
         )
 
     def adapt_policy(self, model_idx, init_obs, horizon=20, batch_size=1000):
-        obs, act, rew, done = self.rollout_single_model(model_idx, init_obs, params=None, horizon=horizon, batch_size=batch_size)
+        obs, act, rew, done, uncertainty = self.rollout_single_model(model_idx, init_obs, params=None, horizon=horizon, batch_size=batch_size)
         
         obs_flat = obs.view(-1, obs.shape[-1])
         act_flat = act.view(-1, act.shape[-1])
@@ -475,22 +504,23 @@ def run():
         # -------------------------
         # PHASE B: OUTER LOOP (META-OPTIMIZATION TRAJECTORIES)
         # -------------------------
-        meta_obs_list, meta_act_list, meta_rew_list, meta_done_list = [], [], [], []
+        meta_obs_list, meta_act_list, meta_rew_list, meta_done_list, meta_uncertainty_list = [], [], [], [], []
 
         for i in range(algo.ensemble_size):
-            m_obs, m_act, m_rew, m_done = algo.rollout_single_model(
+            m_obs, m_act, m_rew, m_done, m_uncertainty = algo.rollout_single_model(
                 model_idx=i, init_obs=init_obs_tensor, params=adapted_params_list[i], horizon=20, batch_size=200
             )
             meta_obs_list.append(m_obs.view(-1, obs_dim))
             meta_act_list.append(m_act.view(-1, act_dim))
             meta_rew_list.append(m_rew.reshape(-1))
             meta_done_list.append(m_done.reshape(-1))
+            meta_uncertainty_list.append(m_uncertainty.reshape(-1))
 
         post_obs = torch.cat(meta_obs_list, dim=0)
         post_act = torch.cat(meta_act_list, dim=0)
         post_rew = torch.cat(meta_rew_list, dim=0)
         post_done = torch.cat(meta_done_list, dim=0)
-
+        post_uncertainty = torch.stack(meta_uncertainty_list)
         with torch.no_grad():
             post_values = algo.value(post_obs).cpu().numpy()
             val_seq = np.append(post_values, 0.0)
@@ -530,7 +560,7 @@ def run():
             value_loss=val_loss.item(),
             kl=kl,
             reward=sim_rew_avg,  # Now displays stabilized grounded simulator rewards
-            entropy=0.0
+            entropy=0.0,
         )
 
         with open(csv_filename, mode='a', newline='') as f:
