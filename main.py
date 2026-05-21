@@ -1,3 +1,5 @@
+import csv
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -261,6 +263,8 @@ class MBMPO:
             healthy_reward = torch.where(is_healthy, torch.ones_like(torso_height), torch.zeros_like(torso_height))
             
             r = forward_velocity - control_cost + healthy_reward
+
+            r = r * (1.0 - batch_dones)
             
             # ---------------------------------------------
             # Shift 3: Done Boundary Termination Masking
@@ -406,6 +410,11 @@ def run():
     algo = MBMPO(obs_dim, act_dim)
     n_iters = 100
 
+    csv_filename = "mb_mpo_metrics.csv"
+    with open(csv_filename, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["iteration", "sim_reward", "ep_reward"]) # Header
+
     for it in tqdm(range(n_iters), desc="MB-MPO Meta-Training"):
 
         # 1. Real data environment interaction tracking
@@ -497,6 +506,10 @@ def run():
             reward=sim_rew_avg,  # Now displays stabilized grounded simulator rewards
             entropy=0.0
         )
+
+        with open(csv_filename, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([it, sim_rew_avg, ep_reward])
 
         tqdm.write(
             f"iter:{it:04d} | "
